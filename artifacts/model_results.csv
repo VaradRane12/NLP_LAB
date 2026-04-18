@@ -1,0 +1,9 @@
+Model,Family,Accuracy,Precision,Recall,F1,ROC AUC,Val Loss,Notes
+RNN,PyTorch,0.603,0.5794392523364486,0.7454909819639278,0.6520595968448729,0.6222864891459565,3.363401853561401,Vanilla recurrent network that learns sequence order but can struggle with long dependencies.
+GRU,PyTorch,0.599,0.5844827586206897,0.6793587174348698,0.6283595922150139,0.6374945499781999,3.8387349281311036,A lighter gated recurrent model that often trains faster than LSTM.
+LSTM,PyTorch,0.574,0.5593495934959349,0.6893787575150301,0.6175942549371634,0.6217444869779479,2.7347097778320313,"Classic memory-based recurrent model, matching the notebook's core architecture."
+RoBERTa,Transformer,0.624,0.5555555555555556,0.6481481481481481,0.5982905982905983,0.6732524778299427,0.682210236574886,Transformer encoder features from roberta-base with a logistic classification head.
+DistilBERT,Transformer,0.616,0.55,0.6111111111111112,0.5789473684210527,0.6067423056859675,0.803629199278373,Transformer encoder features from distilbert-base-uncased with a logistic classification head.
+BERT,Transformer,0.596,0.5294117647058824,0.5833333333333334,0.5550660792951542,0.6403886280646846,0.8805699790890724,Transformer encoder features from bert-base-uncased with a logistic classification head.
+Attention LSTM,PyTorch,0.501,0.0,0.0,0.0,0.5,,LSTM encoder plus attention over hidden states to focus on important tokens.
+Transformer Encoder,PyTorch,0.501,0.0,0.0,0.0,0.5,,A small transformer built with self-attention and positional encoding.

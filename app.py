@@ -2,6 +2,8 @@ import os
 import re
 import gc
 import sys
+import json
+import pickle
 from collections import Counter
 
 import nltk
@@ -10,12 +12,16 @@ import pandas as pd
 import streamlit as st
 import torch
 import torch.nn as nn
+import joblib
 from nltk.corpus import stopwords
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, TensorDataset
+
+AutoModel = None
+AutoTokenizer = None
 
 try:
     from transformers import AutoModel, AutoTokenizer
@@ -36,16 +42,21 @@ st.caption(f"Python runtime: {sys.executable}")
 
 
 DATA_PATH = "data/train-balanced-sarcasm.csv"
+ARTIFACT_DIR = "artifacts"
 MAX_SAMPLES = 2500
 MAX_LEN = 60
 BATCH_SIZE = 64
-EPOCHS = 1
+EPOCHS = 10
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+os.makedirs(ARTIFACT_DIR, exist_ok=True)
 
-# MPS can trigger bus errors on some macOS/PyTorch builds during repeated training+inference.
-if torch.cuda.is_available():
+
+# Use MPS on Apple Silicon when available, otherwise fall back to CUDA/CPU.
+if torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+elif torch.cuda.is_available():
     DEVICE = torch.device("cuda")
 else:
     DEVICE = torch.device("cpu")
@@ -68,15 +79,82 @@ HF_MODEL_IDS = {
     "DistilBERT": "distilbert-base-uncased",
 }
 
+PYTORCH_MODEL_SPECS = {
+    "RNN": {"builder": lambda vocab_size: RNNClassifier(vocab_size), "lr": 0.001},
+    "LSTM": {"builder": lambda vocab_size: LSTMClassifier(vocab_size), "lr": 0.001},
+    "GRU": {"builder": lambda vocab_size: GRUClassifier(vocab_size), "lr": 0.001},
+    "Attention LSTM": {"builder": lambda vocab_size: AttentionLSTMClassifier(vocab_size), "lr": 0.001},
+    "Transformer Encoder": {"builder": lambda vocab_size: TransformerEncoderClassifier(vocab_size), "lr": 0.0008},
+}
+
+def get_model_artifact_paths(model_name: str) -> dict[str, str]:
+    safe_name = model_name.lower().replace(" ", "_")
+    return {
+        "state": os.path.join(ARTIFACT_DIR, f"{safe_name}.pt"),
+        "meta": os.path.join(ARTIFACT_DIR, f"{safe_name}.json"),
+        "hf": os.path.join(ARTIFACT_DIR, f"{safe_name}.joblib"),
+    }
+
+
+def save_vocab(vocab_map: dict[str, int]) -> None:
+    with open(os.path.join(ARTIFACT_DIR, "vocab.pkl"), "wb") as file_handle:
+        pickle.dump(vocab_map, file_handle)
+
+
+def load_vocab() -> dict[str, int] | None:
+    vocab_path = os.path.join(ARTIFACT_DIR, "vocab.pkl")
+    if not os.path.exists(vocab_path):
+        return None
+    with open(vocab_path, "rb") as file_handle:
+        return pickle.load(file_handle)
+
+
+def save_results(results: pd.DataFrame) -> None:
+    results.to_csv(os.path.join(ARTIFACT_DIR, "model_results.csv"), index=False)
+
+
+def load_results() -> pd.DataFrame | None:
+    results_path = os.path.join(ARTIFACT_DIR, "model_results.csv")
+    if not os.path.exists(results_path):
+        return None
+    return pd.read_csv(results_path)
+
+
+def save_pytorch_model(model_name: str, model: nn.Module, vocab_map: dict[str, int]) -> None:
+    paths = get_model_artifact_paths(model_name)
+    torch.save(model.state_dict(), paths["state"])
+    metadata = {
+        "model_name": model_name,
+        "vocab_size": len(vocab_map),
+    }
+    with open(paths["meta"], "w", encoding="utf-8") as file_handle:
+        json.dump(metadata, file_handle)
+
+
+def load_pytorch_model(model_name: str, vocab_size: int) -> nn.Module:
+    paths = get_model_artifact_paths(model_name)
+    model = PYTORCH_MODEL_SPECS[model_name]["builder"](vocab_size).to(DEVICE)
+    model.load_state_dict(torch.load(paths["state"], map_location=DEVICE))
+    model.eval()
+    return model
+
+
+def save_hf_model(model_name: str, classifier: LogisticRegression) -> None:
+    paths = get_model_artifact_paths(model_name)
+    joblib.dump(classifier, paths["hf"])
+
+
+def load_hf_model(model_name: str) -> LogisticRegression:
+    paths = get_model_artifact_paths(model_name)
+    return joblib.load(paths["hf"])
+
 
 def clean_text(text: str) -> str:
-    stop_words = set(stopwords.words("english"))
     text = text.lower()
     text = re.sub(r"http\S+", "", text)
-    text = re.sub(r"[^a-zA-Z\s]", " ", text)
-    words = [word for word in text.split() if word not in stop_words and len(word) > 2]
-    cleaned = " ".join(words).strip()
-    return cleaned if cleaned else text.strip()
+    text = re.sub(r"[^a-zA-Z\s']", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def tokenize(text: str) -> list[str]:
@@ -106,8 +184,10 @@ class RNNClassifier(nn.Module):
         self.fc = nn.Linear(hidden_dim, 2)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        lengths = inputs.ne(0).sum(dim=1).cpu().clamp(min=1)
         embedded = self.embedding(inputs)
-        _, hidden = self.rnn(embedded)
+        packed = nn.utils.rnn.pack_padded_sequence(embedded, lengths, batch_first=True, enforce_sorted=False)
+        _, hidden = self.rnn(packed)
         return self.fc(hidden[-1])
 
 
@@ -119,8 +199,10 @@ class LSTMClassifier(nn.Module):
         self.fc = nn.Linear(hidden_dim, 2)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        lengths = inputs.ne(0).sum(dim=1).cpu().clamp(min=1)
         embedded = self.embedding(inputs)
-        _, (hidden, _) = self.lstm(embedded)
+        packed = nn.utils.rnn.pack_padded_sequence(embedded, lengths, batch_first=True, enforce_sorted=False)
+        _, (hidden, _) = self.lstm(packed)
         return self.fc(hidden[-1])
 
 
@@ -132,8 +214,10 @@ class GRUClassifier(nn.Module):
         self.fc = nn.Linear(hidden_dim, 2)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        lengths = inputs.ne(0).sum(dim=1).cpu().clamp(min=1)
         embedded = self.embedding(inputs)
-        _, hidden = self.gru(embedded)
+        packed = nn.utils.rnn.pack_padded_sequence(embedded, lengths, batch_first=True, enforce_sorted=False)
+        _, hidden = self.gru(packed)
         return self.fc(hidden[-1])
 
 
@@ -146,9 +230,13 @@ class AttentionLSTMClassifier(nn.Module):
         self.fc = nn.Linear(hidden_dim, 2)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        lengths = inputs.ne(0).sum(dim=1).cpu().clamp(min=1)
         embedded = self.embedding(inputs)
-        outputs, _ = self.lstm(embedded)
+        packed = nn.utils.rnn.pack_padded_sequence(embedded, lengths, batch_first=True, enforce_sorted=False)
+        outputs, _ = self.lstm(packed)
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(outputs, batch_first=True, total_length=inputs.size(1))
         scores = self.attention(outputs).squeeze(-1)
+        scores = scores.masked_fill(inputs.eq(0), float("-inf"))
         weights = torch.softmax(scores, dim=1).unsqueeze(-1)
         context = torch.sum(outputs * weights, dim=1)
         return self.fc(context)
@@ -254,6 +342,7 @@ def build_dataset() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Ten
 
 
 def get_hf_backbone(model_id: str):
+    assert AutoModel is not None and AutoTokenizer is not None
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     encoder = AutoModel.from_pretrained(model_id).to(DEVICE)
     encoder.eval()
@@ -334,7 +423,7 @@ def evaluate_model(model: nn.Module, loader: DataLoader) -> dict[str, float]:
 
 
 def train_single_model(model_name: str, model: nn.Module, train_loader: DataLoader, val_loader: DataLoader) -> tuple[nn.Module, dict[str, float]]:
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001 if model_name != "Transformer Encoder" else 0.0008)
+    optimizer = torch.optim.Adam(model.parameters(), lr=PYTORCH_MODEL_SPECS[model_name]["lr"])
     criterion = nn.CrossEntropyLoss()
 
     for _ in range(EPOCHS):
@@ -355,7 +444,12 @@ def train_single_model(model_name: str, model: nn.Module, train_loader: DataLoad
 
 
 @st.cache_resource
-def train_models():
+def train_models(force_retrain: bool = False):
+    if not force_retrain:
+        loaded = load_saved_artifacts()
+        if loaded is not None:
+            return loaded
+
     (
         train_inputs,
         train_targets,
@@ -383,6 +477,7 @@ def train_models():
         model = builder(len(vocab)).to(DEVICE)
         model, metrics = train_single_model(model_name, model, train_loader, val_loader)
         trained_models[model_name] = {"family": "pytorch", "model": model}
+        save_pytorch_model(model_name, model, vocab)
         result_rows.append(
             {
                 "Model": model_name,
@@ -415,6 +510,7 @@ def train_models():
 
             classifier = LogisticRegression(max_iter=1000, class_weight="balanced")
             classifier.fit(train_embeddings, hf_train_labels)
+            save_hf_model(display_name, classifier)
 
             predictions = classifier.predict(val_embeddings)
             probabilities = classifier.predict_proba(val_embeddings)[:, 1]
@@ -460,10 +556,50 @@ def train_models():
     status.empty()
 
     results = pd.DataFrame(result_rows).sort_values(by="F1", ascending=False).reset_index(drop=True)
+    save_vocab(vocab)
+    save_results(results)
     return trained_models, results, vocab
 
 
-trained_models, model_results, vocab = train_models()
+def load_saved_artifacts():
+    vocab_map = load_vocab()
+    results = load_results()
+    if vocab_map is None or results is None:
+        return None
+
+    trained_models = {}
+    for model_name in MODEL_BUILDERS:
+        paths = get_model_artifact_paths(model_name)
+        if not os.path.exists(paths["state"]):
+            return None
+        trained_models[model_name] = {"family": "pytorch", "model": load_pytorch_model(model_name, len(vocab_map))}
+
+    if TRANSFORMERS_AVAILABLE:
+        for display_name in HF_MODEL_IDS:
+            paths = get_model_artifact_paths(display_name)
+            if not os.path.exists(paths["hf"]):
+                return None
+            trained_models[display_name] = {
+                "family": "hf",
+                "model_id": HF_MODEL_IDS[display_name],
+                "classifier": load_hf_model(display_name),
+            }
+
+    return trained_models, results, vocab_map
+
+
+trained_models: dict[str, dict] = {}
+model_results = pd.DataFrame()
+vocab: dict[str, int] = {}
+artifact_bundle = load_saved_artifacts()
+
+if artifact_bundle is None:
+    st.error(
+        "No saved model bundle found yet. Run train_models.py once from the terminal to train and save the models, then reopen the app."
+    )
+    st.stop()
+else:
+    trained_models, model_results, vocab = artifact_bundle
 
 
 def vectorize_text(text: str, vocab_map: dict[str, int]) -> torch.Tensor:
